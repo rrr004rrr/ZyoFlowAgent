@@ -1,0 +1,11 @@
+{
+  "station": "192.168.x.x:39217",
+  "self_addr": "",
+  "claude_bin": "claude",
+  "worktree_root": "D:/zyoflow/worktrees",
+  "repos": [
+    { "name": "前端",  "path": "D:/work/frontend",      "keywords": "前端, React, 畫面, UI, 使用者介面, 網頁" },
+    { "name": "後台",  "path": "D:/work/backend-admin", "keywords": "後台, 管理介面, admin, 後台管理" },
+    { "name": "API",   "path": "D:/work/api",           "keywords": "API, 後端服務, REST, 介面, 資料庫" }
+  ]
+}

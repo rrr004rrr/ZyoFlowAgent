@@ -1,0 +1,30 @@
+# Build artifacts
+target/
+build/
+dist/
+*.spec
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Local data / databases / logs
+*.sqlite
+*.log
+
+# Secrets & per-machine config (credentials / local paths) — never commit
+zentao.json
+feishu.json
+lark.json
+sub.json
+master.toml
+sub.toml
+
+# Old design kept locally for reference only
+_legacy/
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/

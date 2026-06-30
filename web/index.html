@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZyoFlow 站台閘道</title>
+<style>
+  body { font-family: system-ui, "Microsoft JhengHei", sans-serif; margin: 24px; max-width: 900px; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 14px; }
+  th { background: #f5f5f5; }
+  input[type=text] { padding: 5px; }
+  button { padding: 5px 12px; cursor: pointer; }
+  .muted { color: #888; font-size: 13px; }
+  .msg { border-left: 3px solid #4a90d9; padding: 4px 10px; margin: 6px 0; background: #fafafa; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
+</style>
+</head>
+<body>
+  <h1>ZyoFlow 站台閘道</h1>
+  <p class="muted">
+    Zentao webhook 指向 <code id="hookUrl"></code>（設定一次就好）　·　收到後轉發給下面啟用的 Master
+  </p>
+
+  <h2>轉發到的 Master</h2>
+  <table>
+    <thead><tr><th>名稱</th><th>位址（host:port）</th><th>啟用</th><th>操作</th></tr></thead>
+    <tbody id="masters"></tbody>
+  </table>
+  <div class="row">
+    <input type="text" id="name" placeholder="名稱（例：我的電腦）">
+    <input type="text" id="addr" placeholder="位址（例：192.168.x.x:39218）">
+    <button onclick="addMaster()">新增</button>
+  </div>
+
+  <h2>最近收到的通知 <button onclick="loadMsgs()">重新整理</button>
+    <button onclick="testSend()">送測試訊息</button></h2>
+  <div id="msgs"></div>
+
+<script>
+document.getElementById('hookUrl').textContent = location.origin + '/webhook';
+let MASTERS = [];
+
+async function loadMasters() {
+  MASTERS = await (await fetch('/api/masters')).json();
+  document.getElementById('masters').innerHTML = MASTERS.map(m => `
+    <tr>
+      <td>${esc(m.name)}</td>
+      <td>${esc(m.addr)}</td>
+      <td><input type="checkbox" ${m.enabled ? 'checked' : ''} onchange="toggle(${m.id}, this.checked)"></td>
+      <td><button onclick="del(${m.id})">刪除</button></td>
+    </tr>`).join('') || '<tr><td colspan="4" class="muted">尚無 Master，請新增。</td></tr>';
+}
+async function addMaster() {
+  const name = document.getElementById('name').value.trim();
+  const addr = document.getElementById('addr').value.trim();
+  if (!name || !addr) { alert('名稱和位址都要填'); return; }
+  const r = await fetch('/api/masters', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, addr})});
+  if (!r.ok) { alert((await r.json()).error || '新增失敗'); return; }
+  document.getElementById('name').value = ''; document.getElementById('addr').value = '';
+  loadMasters();
+}
+async function toggle(id, enabled) {
+  const m = MASTERS.find(x => x.id === id);
+  await fetch('/api/masters/' + id, {method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: m.name, addr: m.addr, enabled})});
+}
+async function del(id) {
+  if (!confirm('確定刪除？')) return;
+  await fetch('/api/masters/' + id, {method:'DELETE'}); loadMasters();
+}
+async function loadMsgs() {
+  const m = await (await fetch('/api/messages')).json();
+  document.getElementById('msgs').innerHTML = m.map(x => `
+    <div class="msg"><b>${esc(x.title||'')}</b> <span class="muted">${x.created_at}</span>
+      <div>${esc(x.body||'')}</div></div>`).join('') || '<p class="muted">尚無通知。</p>';
+}
+async function testSend() {
+  const r = await (await fetch('/api/test-send', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({})})).json();
+  alert('已送出，轉發給 ' + r.forwarded + ' 台 Master'); loadMsgs();
+}
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+loadMasters(); loadMsgs();
+</script>
+</body>
+</html>
