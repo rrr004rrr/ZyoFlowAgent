@@ -19,7 +19,7 @@ use axum::{
 use eframe::egui;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use unicode_width::UnicodeWidthStr;
 use std::time::Duration;
@@ -71,6 +71,10 @@ fn main() -> eframe::Result<()> {
             owners     TEXT,                -- Zentao 負責人帳號，逗號分隔（一 Sub 可多負責人）
             enabled    INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS settings(
+            key   TEXT PRIMARY KEY,
+            value TEXT
         );",
     )
     .expect("建表失敗");
@@ -172,6 +176,16 @@ async fn webhook(State(st): State<AppState>, body: Bytes) -> (StatusCode, Json<V
     }
 
     if is_task {
+        // 派發規則過濾：類型/動作/產品不符就只顯示、不派發
+        let r_product = str_field(&data, "product").unwrap_or_default();
+        let r_action = str_field(&data, "action").unwrap_or_default();
+        let r_otype = str_field(&data, "object_type")
+            .or_else(|| str_field(&data, "objectType"))
+            .unwrap_or_default();
+        if !task_passes_rules(&st.db, &r_otype, &r_action, &r_product) {
+            println!("[rule] 任務不符派發規則，略過 (type={r_otype} action={r_action} product={r_product})");
+            return (StatusCode::OK, Json(json!({ "ok": true, "filtered": true })));
+        }
         // 依 assignee 路由：dispatch 給 owners 含該負責人的啟用 Sub
         let targets = subs_for_owner(&st.db, &assignee);
         let dispatch_payload = json!({
@@ -273,6 +287,7 @@ fn load_recent(db: &Db) -> Vec<Msg> {
 enum Tab {
     Tasks,
     Subs,
+    Rules,
     Lark,
     Settings,
 }
@@ -314,6 +329,11 @@ struct MasterApp {
     lark_log: Arc<Mutex<Vec<String>>>,        // 發送結果日誌（背景執行緒寫、GUI 讀）
     lark_token: Arc<lark::TokenCache>,        // 共享 token 快取
     lark_last_msg: Arc<Mutex<Option<String>>>, // 最後一張卡片的 message_id（給就地更新用）
+    // 派發規則
+    rule_types: HashSet<String>,
+    rule_actions: HashSet<String>,
+    rule_products: String,
+    rules_saved: bool,
     _tray: tray_icon::TrayIcon, // 保持存活：drop 掉圖示就消失
 }
 
@@ -330,6 +350,13 @@ impl MasterApp {
         let users = Arc::new(Mutex::new(Vec::new()));
         spawn_user_fetch(users.clone(), cc.egui_ctx.clone()); // 啟動時撈一次 Zentao 名單
         let cfg = lark::load_config(); // 飛書憑證 + 固定群組（存於 appdata）
+        let rule_types = load_rule_set(&db, "rule_types", &["task", "bug", "story"]);
+        let rule_actions = load_rule_set(
+            &db,
+            "rule_actions",
+            &["opened", "assigned", "edited", "finished", "closed", "commented"],
+        );
+        let rule_products = get_setting(&db, "rule_products").unwrap_or_default();
         Self {
             feed,
             db,
@@ -366,6 +393,10 @@ impl MasterApp {
             lark_log: Arc::new(Mutex::new(Vec::new())),
             lark_token: Arc::new(Mutex::new(None)),
             lark_last_msg: Arc::new(Mutex::new(None)),
+            rule_types,
+            rule_actions,
+            rule_products,
+            rules_saved: false,
             _tray: tray,
         }
     }
@@ -507,6 +538,82 @@ impl MasterApp {
             });
         ui.add_space(16.0);
         ui.weak("更多設定之後加入。");
+    }
+
+    /// 派發規則：控管哪些任務類型 / 動作 / 產品才派發給 Sub。
+    fn rules_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.label("只有符合下列全部條件的任務才會派發給 Sub；不符合的只在「任務」分頁顯示、不派發。");
+
+        ui.add_space(10.0);
+        ui.strong("任務類型");
+        ui.horizontal_wrapped(|ui| {
+            for (val, label) in [("task", "任務"), ("bug", "Bug"), ("story", "需求")] {
+                let mut on = self.rule_types.contains(val);
+                if ui.checkbox(&mut on, label).changed() {
+                    self.rules_saved = false;
+                    if on {
+                        self.rule_types.insert(val.to_string());
+                    } else {
+                        self.rule_types.remove(val);
+                    }
+                }
+            }
+        });
+        ui.weak("全部不勾 = 不限制（全收）。");
+
+        ui.add_space(10.0);
+        ui.strong("觸發動作");
+        ui.horizontal_wrapped(|ui| {
+            for (val, label) in [
+                ("opened", "建立"),
+                ("assigned", "指派"),
+                ("edited", "編輯"),
+                ("finished", "完成"),
+                ("closed", "關閉"),
+                ("commented", "評論"),
+            ] {
+                let mut on = self.rule_actions.contains(val);
+                if ui.checkbox(&mut on, label).changed() {
+                    self.rules_saved = false;
+                    if on {
+                        self.rule_actions.insert(val.to_string());
+                    } else {
+                        self.rule_actions.remove(val);
+                    }
+                }
+            }
+        });
+        ui.weak("全部不勾 = 不限制（全收）。");
+
+        ui.add_space(10.0);
+        ui.strong("限定產品（product）");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.rule_products)
+                    .desired_width(340.0)
+                    .hint_text("留空 = 全部；或填產品值，逗號分隔"),
+            )
+            .changed()
+        {
+            self.rules_saved = false;
+        }
+        ui.weak("產品值就是 Sub 視窗顯示的 product（你的禪道可能是數字 ID）。");
+
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            if ui.button("💾 儲存規則").clicked() {
+                set_setting(&self.db, "rule_types", &csv_of(&self.rule_types));
+                set_setting(&self.db, "rule_actions", &csv_of(&self.rule_actions));
+                set_setting(&self.db, "rule_products", self.rule_products.trim());
+                self.rules_saved = true;
+            }
+            if self.rules_saved {
+                ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "已儲存");
+            } else {
+                ui.weak("有變更，記得按儲存");
+            }
+        });
     }
 
     /// 飛書出站測試頁：填憑證 + 收件人，發 純文字 / 富文本 / 互動卡片，並可就地更新卡片。
@@ -1036,6 +1143,7 @@ impl eframe::App for MasterApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Tasks, "任務");
                 ui.selectable_value(&mut self.tab, Tab::Subs, "Sub 路由");
+                ui.selectable_value(&mut self.tab, Tab::Rules, "派發規則");
                 ui.selectable_value(&mut self.tab, Tab::Lark, "飛書測試");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "設定");
             });
@@ -1045,6 +1153,7 @@ impl eframe::App for MasterApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Tasks => self.tasks_view(ui),
             Tab::Subs => self.subs_view(ui),
+            Tab::Rules => self.rules_view(ui),
             Tab::Lark => self.lark_view(ui),
             Tab::Settings => self.settings_view(ui),
         });
@@ -1177,6 +1286,58 @@ fn all_enabled_subs(db: &Db) -> Vec<String> {
             Ok(rows.filter_map(Result::ok).collect())
         })
         .unwrap_or_default()
+}
+
+// -------------------------------------------------- 派發規則（settings 表）
+fn get_setting(db: &Db, key: &str) -> Option<String> {
+    let conn = db.lock().unwrap();
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get::<_, String>(0))
+        .ok()
+}
+
+fn set_setting(db: &Db, key: &str, value: &str) {
+    let conn = db.lock().unwrap();
+    let _ = conn.execute(
+        "INSERT INTO settings(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+        rusqlite::params![key, value],
+    );
+}
+
+/// 任務是否符合派發規則。類型/動作走成員比對（未設定=全部、設定後不在清單=擋）；產品留空=全部。
+fn task_passes_rules(db: &Db, otype: &str, action: &str, product: &str) -> bool {
+    let membership = |key: &str, val: &str| match get_setting(db, key) {
+        None => true,
+        Some(csv) => csv.split(',').map(str::trim).any(|x| x == val),
+    };
+    let allowlist = |key: &str, val: &str| match get_setting(db, key) {
+        None => true,
+        Some(csv) => {
+            let t = csv.trim();
+            t.is_empty() || t.split(',').map(str::trim).any(|x| x == val)
+        }
+    };
+    membership("rule_types", otype)
+        && membership("rule_actions", action)
+        && allowlist("rule_products", product)
+}
+
+/// 從 settings 讀規則集合；未設定回傳「全部」當預設。
+fn load_rule_set(db: &Db, key: &str, all: &[&str]) -> HashSet<String> {
+    match get_setting(db, key) {
+        Some(csv) => csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        None => all.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn csv_of(set: &HashSet<String>) -> String {
+    let mut v: Vec<&str> = set.iter().map(String::as_str).collect();
+    v.sort_unstable();
+    v.join(",")
 }
 
 fn load_subs(db: &Db) -> Vec<Sub> {
