@@ -1303,22 +1303,16 @@ fn set_setting(db: &Db, key: &str, value: &str) {
     );
 }
 
-/// 任務是否符合派發規則。類型/動作走成員比對（未設定=全部、設定後不在清單=擋）；產品留空=全部。
+/// 任務是否符合派發規則。三者皆「未設定或留空 = 不限制(全收)；否則須在清單內」。
 fn task_passes_rules(db: &Db, otype: &str, action: &str, product: &str) -> bool {
-    let membership = |key: &str, val: &str| match get_setting(db, key) {
-        None => true,
-        Some(csv) => csv.split(',').map(str::trim).any(|x| x == val),
-    };
-    let allowlist = |key: &str, val: &str| match get_setting(db, key) {
+    let allows = |key: &str, val: &str| match get_setting(db, key) {
         None => true,
         Some(csv) => {
             let t = csv.trim();
             t.is_empty() || t.split(',').map(str::trim).any(|x| x == val)
         }
     };
-    membership("rule_types", otype)
-        && membership("rule_actions", action)
-        && allowlist("rule_products", product)
+    allows("rule_types", otype) && allows("rule_actions", action) && allows("rule_products", product)
 }
 
 /// 從 settings 讀規則集合；未設定回傳「全部」當預設。
