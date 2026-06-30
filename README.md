@@ -134,4 +134,4 @@ cd sub && cargo build --release        # 或 build.bat
 
 ## 授權
 
-尚未指定（預設保留所有權利）。可自行加入 `LICENSE`，例如 MIT。
+本專案採用 **MIT** 授權，見 [LICENSE](LICENSE)。
