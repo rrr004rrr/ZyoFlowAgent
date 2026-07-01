@@ -1,6 +1,6 @@
 //! ZyoFlow Sub — 桌面常駐接收端（egui / eframe），Windows + macOS。
 //!
-//! 流程：收 Master 派發(/dispatch) → 設 git worktree → 跑 Claude headless →
+//! 流程：收站台派發(/dispatch) → 設 git worktree → 跑 Claude headless →
 //!       遇決策 Claude 吐 `@@ASK@@ {questions}` → 發站台(/lark/ask)發飛書問題卡 →
 //!       使用者在飛書點選 → 站台把答案 POST 回本端(/answer) → `claude --resume` 續跑。
 //!
@@ -35,6 +35,17 @@ struct Msg {
 
 type Feed = Arc<Mutex<Vec<Msg>>>;
 type Pending = Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>; // cid → 等答案的 runner
+
+/// 站台回來的本機綁定狀態（給 GUI「綁定狀態」分頁顯示）。
+#[derive(Clone, Default)]
+struct Binding {
+    zentao_account: String,
+    feishu_name: String,
+    enabled: bool,
+    registered: bool,   // 是否成功向站台報到過
+    last_error: String, // 報到失敗原因
+}
+type BindingState = Arc<Mutex<Binding>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -100,6 +111,54 @@ fn local_ip() -> Option<String> {
     s.local_addr().ok().map(|a| a.ip().to_string())
 }
 
+/// 電腦名稱（站台綁定用的穩定鍵）：先試 hostname 指令，再退環境變數。
+fn hostname() -> String {
+    if let Ok(out) = Command::new("hostname").output() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "sub".into())
+}
+
+/// 開機起每 60 秒向站台 /api/register 報到 {hostname, addr}，並把回來的綁定寫進共享狀態。
+fn register_loop(station: String, self_addr: String, host: String, state: BindingState) {
+    if station.trim().is_empty() || self_addr.trim().is_empty() {
+        state.lock().unwrap().last_error = "sub.json 未設定 station，或偵測不到 self_addr".into();
+        return;
+    }
+    let url = format!("http://{station}/api/register");
+    let payload = json!({ "hostname": host, "addr": self_addr }).to_string();
+    loop {
+        match ureq::post(&url)
+            .timeout(Duration::from_secs(5))
+            .set("Content-Type", "application/json")
+            .send_string(&payload)
+        {
+            Ok(resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let b = v.get("binding").cloned().unwrap_or(Value::Null);
+                let mut g = state.lock().unwrap();
+                g.zentao_account = sv(&b, "zentao_account");
+                g.feishu_name = sv(&b, "feishu_name");
+                g.enabled = b.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                g.registered = true;
+                g.last_error.clear();
+            }
+            Err(e) => {
+                let mut g = state.lock().unwrap();
+                g.registered = false;
+                g.last_error = e.to_string();
+            }
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let port: u16 = std::env::var("ZYOFLOW_SUB_PORT")
         .ok()
@@ -111,18 +170,29 @@ fn main() -> eframe::Result<()> {
             cfg.self_addr = format!("{ip}:{port}");
         }
     }
+    let host = hostname();
+    let station = cfg.station.clone();
+    let self_addr = cfg.self_addr.clone();
     println!(
-        "[sub] station={} self_addr={} repos={}",
-        cfg.station,
-        cfg.self_addr,
+        "[sub] host={} station={} self_addr={} repos={}",
+        host,
+        station,
+        self_addr,
         cfg.repos.len()
     );
     let feed: Feed = Arc::new(Mutex::new(Vec::new()));
+    let binding: BindingState = Arc::new(Mutex::new(Binding::default()));
     let state = AppState {
         feed: feed.clone(),
         pending: Arc::new(Mutex::new(HashMap::new())),
         cfg: Arc::new(cfg),
     };
+
+    // 背景執行緒：向站台定期報到（送 IP，收綁定）
+    {
+        let (s, a, h, b) = (station.clone(), self_addr.clone(), host.clone(), binding.clone());
+        std::thread::spawn(move || register_loop(s, a, h, b));
+    }
 
     // 背景執行緒：HTTP 伺服器
     std::thread::spawn(move || {
@@ -140,7 +210,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         options,
-        Box::new(move |cc| Ok(Box::new(SubApp::new(cc, feed, port)))),
+        Box::new(move |cc| {
+            Ok(Box::new(SubApp::new(cc, feed, port, binding, station, self_addr, host)))
+        }),
     )
 }
 
@@ -162,7 +234,7 @@ async fn serve(port: u16, state: AppState) {
     }
 }
 
-/// Master 廣播的舊格式訊息（測試/通知），純顯示。
+/// 站台廣播的舊格式訊息（測試/通知），純顯示。
 async fn push(State(st): State<AppState>, body: Bytes) -> Json<Value> {
     let raw = String::from_utf8_lossy(&body).into_owned();
     let (title, text, created_at) = extract(&raw);
@@ -171,7 +243,7 @@ async fn push(State(st): State<AppState>, body: Bytes) -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-/// Master 派發任務 → 背景跑 Claude。
+/// 站台派發任務 → 背景跑 Claude。
 async fn dispatch(State(st): State<AppState>, body: Bytes) -> Json<Value> {
     let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let task = Task {
@@ -554,7 +626,7 @@ fn report(feed: &Feed, task: &Task, msg: impl Into<String>) {
     );
 }
 
-/// 從 Master 推來的 JSON 取 (title, body, created_at)，缺欄位回空字串。
+/// 從站台推來的 JSON 取 (title, body, created_at)，缺欄位回空字串。
 fn extract(raw: &str) -> (String, String, String) {
     let v: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
     let f = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -562,17 +634,115 @@ fn extract(raw: &str) -> (String, String, String) {
 }
 
 // ------------------------------------------------------------ GUI
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Feed,    // 接收訊息
+    Binding, // 綁定狀態
+}
+
 struct SubApp {
     feed: Feed,
     port: u16,
+    tab: Tab,
+    binding: BindingState,
+    station: String,
+    self_addr: String,
+    host: String,
     _tray: tray_icon::TrayIcon, // 保持存活：drop 掉圖示就消失
 }
 
 impl SubApp {
-    fn new(cc: &eframe::CreationContext<'_>, feed: Feed, port: u16) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        feed: Feed,
+        port: u16,
+        binding: BindingState,
+        station: String,
+        self_addr: String,
+        host: String,
+    ) -> Self {
         install_cjk_font(&cc.egui_ctx);
         let tray = build_tray(cc.egui_ctx.clone());
-        Self { feed, port, _tray: tray }
+        Self { feed, port, tab: Tab::Feed, binding, station, self_addr, host, _tray: tray }
+    }
+
+    /// 「接收訊息」分頁：站台派發 / 通知列表。
+    fn feed_view(&self, ui: &mut egui::Ui) {
+        let feed: Vec<Msg> = self.feed.lock().unwrap().clone(); // 快照
+        if feed.is_empty() {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| ui.weak("等待站台派發…"));
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for m in feed.iter().rev() {
+                    // 新→舊
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.strong(&m.title);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| ui.weak(&m.created_at),
+                            );
+                        });
+                        if !m.body.is_empty() {
+                            ui.label(&m.body);
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+    }
+
+    /// 「綁定狀態」分頁：本機在站台的綁定（每分鐘由報到更新）。
+    fn binding_view(&self, ui: &mut egui::Ui) {
+        let b = self.binding.lock().unwrap().clone();
+        let green = egui::Color32::from_rgb(46, 160, 67);
+        ui.add_space(10.0);
+        egui::Grid::new("binding")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.strong("電腦名稱");
+                ui.label(&self.host);
+                ui.end_row();
+                ui.strong("本機位址");
+                ui.label(if self.self_addr.is_empty() { "（偵測失敗）" } else { &self.self_addr });
+                ui.end_row();
+                ui.strong("站台 Stage");
+                ui.label(if self.station.is_empty() { "（未設定）" } else { &self.station });
+                ui.end_row();
+                ui.strong("報到狀態");
+                if b.registered {
+                    ui.colored_label(green, "● 已向站台報到");
+                } else {
+                    ui.colored_label(egui::Color32::RED, format!("● 未報到　{}", b.last_error))
+                        .on_hover_text("開機起每 60 秒自動重試");
+                }
+                ui.end_row();
+                ui.strong("Zentao 負責人");
+                ui.label(if b.zentao_account.is_empty() {
+                    "（未綁定）".to_string()
+                } else {
+                    b.zentao_account.clone()
+                });
+                ui.end_row();
+                ui.strong("飛書用戶");
+                ui.label(if b.feishu_name.is_empty() {
+                    "（未綁定）".to_string()
+                } else {
+                    b.feishu_name.clone()
+                });
+                ui.end_row();
+                ui.strong("啟用");
+                ui.label(if b.enabled { "是" } else { "否" });
+                ui.end_row();
+            });
+        ui.add_space(10.0);
+        ui.weak("綁定在站台控管網頁設定；本頁每分鐘自動更新。");
     }
 }
 
@@ -595,37 +765,17 @@ impl eframe::App for SubApp {
                     );
                 });
             });
+            // 頁籤（保留後續擴充）
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Feed, "接收訊息");
+                ui.selectable_value(&mut self.tab, Tab::Binding, "綁定狀態");
+            });
             ui.add_space(2.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let feed: Vec<Msg> = self.feed.lock().unwrap().clone(); // 快照
-            if feed.is_empty() {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| ui.weak("等待 Master 派發…"));
-                return;
-            }
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for m in feed.iter().rev() {
-                        // 新→舊
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.strong(&m.title);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| ui.weak(&m.created_at),
-                                );
-                            });
-                            if !m.body.is_empty() {
-                                ui.label(&m.body);
-                            }
-                        });
-                        ui.add_space(6.0);
-                    }
-                });
+        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+            Tab::Feed => self.feed_view(ui),
+            Tab::Binding => self.binding_view(ui),
         });
 
         // 隱藏是 OS 層級做的，eframe 認為視窗一直可見，這個 tick 會一直跑、feed 保持更新
