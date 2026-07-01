@@ -1,11 +1,13 @@
-"""ZyoFlow 站台閘道 — 固定接 Zentao webhook，轉發給各 Master。
+"""ZyoFlow Stage 站台 — 直接接 Zentao webhook + 飛書，路由派發給各 Sub（已移除 Master 中間層）。
 
-  Zentao --(固定 webhook，設定一次)--> 本服務（站台 39217）--(轉發)--> Master（個人電腦 39218）
+  Zentao --(固定 webhook)--> 本服務（Stage 39217）--(依負責人綁定)--> Sub（個人電腦 39219）
 
 單檔 Flask app：
-  POST /webhook        接 Zentao webhook：存檔 + 轉發給所有啟用的 Master
-  GET  /               配置網站（管理要轉發的 Master、看最近通知、送測試）
-  API  /api/masters    Master 端點增刪改查；/api/messages 最近通知；/api/test-send 測試送
+  POST /webhook        接 Zentao webhook：撈細節 + 依 assignee 派給綁定的 Sub
+  POST /api/register   Sub 開機/定期回報 {hostname, addr}，Stage 記錄並回綁定
+  GET  /               控管網站（綁定 Sub↔Zentao↔飛書、看通知、送測試）
+  API  /api/subs       Sub 綁定增刪改查；/api/users 禪道名單；/api/feishu-members 群成員
+  飛書長連接           收卡片回調（問題卡）＋ 群訊息指令（/bindCheck…，可擴充）
 
 跑在站台主機，預設 port 39217（ZYOFLOW_PORT 可覆寫）。
 """
@@ -50,12 +52,15 @@ def init_db():
     with db() as c:
         c.executescript(
             """
-            CREATE TABLE IF NOT EXISTS masters(
-              id         INTEGER PRIMARY KEY,
-              name       TEXT NOT NULL,
-              addr       TEXT NOT NULL,           -- host:port，例如 192.168.x.x:39218
-              enabled    INTEGER NOT NULL DEFAULT 1,
-              created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            CREATE TABLE IF NOT EXISTS subs(
+              id             INTEGER PRIMARY KEY,
+              hostname       TEXT UNIQUE,          -- 綁定的穩定鍵；DHCP 換 IP 也不掉綁定
+              addr           TEXT,                 -- ip:port，Sub 每次報到更新
+              zentao_account TEXT,                 -- 綁定：禪道負責人帳號（任務路由用）
+              feishu_open_id TEXT,                 -- 綁定：飛書 open_id（指令路由用）
+              feishu_name    TEXT,                 -- 綁定的飛書顯示名
+              enabled        INTEGER NOT NULL DEFAULT 1,
+              last_seen      TEXT
             );
             CREATE TABLE IF NOT EXISTS messages(
               id         INTEGER PRIMARY KEY,
@@ -68,26 +73,73 @@ def init_db():
         )
 
 
-# ----------------------------------------------------- 轉發給 Master
-def forward_to_masters(raw_bytes: bytes, addrs: list):
-    """把原始 payload 原封不動 POST 給每個 Master 的 /webhook；背景執行，失敗只記 log。"""
+def norm_addr(s: str) -> str:
+    """使用者可能填 http://x:39219 或 x:39219/dispatch，一律 normalize 成 host:port。"""
+    s = (s or "").strip().removeprefix("http://").removeprefix("https://").rstrip("/")
+    for suffix in ("/dispatch", "/answer", "/webhook", "/push"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].rstrip("/")
+    return s
+
+
+# ------------------------------------------------------ Sub 路由 / 派發
+def sub_for_account(account: str):
+    """依禪道負責人帳號找出綁定且啟用的 Sub 位址；沒有回 None。"""
+    if not (account or "").strip():
+        return None
+    with db() as c:
+        r = c.execute(
+            "SELECT addr FROM subs WHERE enabled=1 AND zentao_account=? AND addr<>''", (account,)
+        ).fetchone()
+    return r["addr"] if r else None
+
+
+def sub_for_open_id(open_id: str):
+    """依飛書 open_id 找出綁定且啟用的 Sub 位址；沒有回 None。"""
+    if not open_id:
+        return None
+    with db() as c:
+        r = c.execute(
+            "SELECT addr FROM subs WHERE enabled=1 AND feishu_open_id=? AND addr<>''", (open_id,)
+        ).fetchone()
+    return r["addr"] if r else None
+
+
+def dispatch_to_sub(addr: str, payload_bytes: bytes) -> bool:
+    """把 enriched task 原封 POST 給 Sub 的 /dispatch。"""
+    url = f"http://{addr}/dispatch"
+    try:
+        req = urllib.request.Request(
+            url, data=payload_bytes, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        urllib.request.urlopen(req, timeout=5).close()
+        print(f"[dispatch] 已派發 → {url}", flush=True)
+        return True
+    except Exception as e:  # noqa: BLE001 - 派發失敗不可中斷主流程
+        print(f"[dispatch] {url} 失敗: {e}", flush=True)
+        return False
+
+
+def store_message(title, body, raw):
+    """通知落庫（控管網頁的「最近通知」）。"""
+    with db() as c:
+        c.execute("INSERT INTO messages(title, body, raw) VALUES(?,?,?)", (title, body, raw))
+
+
+def push_to_subs(payload_bytes: bytes) -> int:
+    """把顯示用訊息推給所有啟用 Sub 的 /push（測試/通知用），回推送台數。"""
+    with db() as c:
+        addrs = [r["addr"] for r in c.execute("SELECT addr FROM subs WHERE enabled=1 AND addr<>''")]
     for addr in addrs:
-        url = f"http://{addr}/webhook"
         try:
             req = urllib.request.Request(
-                url, data=raw_bytes, headers={"Content-Type": "application/json"}, method="POST"
+                f"http://{addr}/push", data=payload_bytes,
+                headers={"Content-Type": "application/json"}, method="POST",
             )
             urllib.request.urlopen(req, timeout=5).close()
-        except Exception as e:  # noqa: BLE001 - 轉發失敗不可中斷主流程
-            print(f"[forward] {url} 失敗: {e}", flush=True)
-
-
-def norm_addr(s: str) -> str:
-    """使用者可能填 http://x:39218 或 x:39218/webhook，一律 normalize 成 host:port。"""
-    s = s.strip().removeprefix("http://").removeprefix("https://").rstrip("/")
-    if s.endswith("/webhook"):
-        s = s[: -len("/webhook")].rstrip("/")
-    return s
+        except Exception as e:  # noqa: BLE001
+            print(f"[push] {addr} 失敗: {e}", flush=True)
+    return len(addrs)
 
 
 # ----------------------------------------------------- Zentao API
@@ -178,10 +230,8 @@ def _strip_html(s):
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
 
-# --------------------------------------------------------- Zentao 解析
 def parse_zentao(data, raw: str):
-    """Zentao webhook 格式依類型而異，這裡寬鬆抽取、原文一律保留。
-    看到真實 payload 後再依欄位精修。"""
+    """Zentao webhook 格式依類型而異，這裡寬鬆抽取、原文一律保留。"""
     if isinstance(data, dict):
         title = data.get("title") or data.get("subject") or data.get("action") or "Zentao 通知"
         body = data.get("text") or data.get("content") or data.get("comment") or raw[:500]
@@ -189,18 +239,7 @@ def parse_zentao(data, raw: str):
     return "Zentao 通知", (raw or "")[:500]
 
 
-def _deliver(title, body, raw, raw_bytes):
-    """存檔 → 背景轉發給啟用的 Master。回傳轉發的 Master 數。"""
-    with db() as c:
-        c.execute("INSERT INTO messages(title, body, raw) VALUES(?,?,?)", (title, body, raw))
-        addrs = [r["addr"] for r in c.execute("SELECT addr FROM masters WHERE enabled=1")]
-    if addrs:
-        threading.Thread(target=forward_to_masters, args=(raw_bytes, addrs), daemon=True).start()
-    return len(addrs)
-
-
-# ----------------------------------------------------- 飛書長連接（卡片回調）
-# 站台「撥出去」連 Feishu 收按鈕點擊（card.action.trigger）；不需對外公開，只需連得出去。
+# ----------------------------------------------------- 飛書共用
 FEISHU_CFG = DATA_DIR / "feishu.json"
 
 
@@ -254,6 +293,49 @@ def feishu_update_card(app_id, app_secret, message_id, card):
         return r.read()
 
 
+def feishu_reply_text(chat_id, text):
+    """發純文字到群組（指令回覆用）。失敗只記 log。"""
+    cfg = feishu_cfg()
+    app_id, app_secret = cfg.get("app_id"), cfg.get("app_secret")
+    if not (app_id and app_secret and chat_id):
+        return
+    body = json.dumps(
+        {"receive_id": chat_id, "msg_type": "text",
+         "content": json.dumps({"text": text}, ensure_ascii=False)},
+        ensure_ascii=False,
+    ).encode()
+    req = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {_feishu_token(app_id, app_secret)}"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10).close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[feishu] 回訊息失敗: {e}", flush=True)
+
+
+def feishu_chat_members():
+    """列目標群組成員 (open_id, name)，供網頁綁定下拉。需 im:chat 權限、feishu.json 有 chat_id。"""
+    cfg = feishu_cfg()
+    app_id, app_secret, chat_id = cfg.get("app_id"), cfg.get("app_secret"), cfg.get("chat_id")
+    if not (app_id and app_secret and chat_id):
+        raise RuntimeError("feishu.json 未設定 app_id/app_secret/chat_id")
+    token = _feishu_token(app_id, app_secret)
+    url = (f"https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members"
+           "?member_id_type=open_id&page_size=100")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read())
+    items = (data.get("data") or {}).get("items") or []
+    # ponytail: 只取第一頁 100 人；一般群足夠，超過再加 page_token 分頁
+    return [{"open_id": it.get("member_id", ""), "name": it.get("name", "")}
+            for it in items if it.get("member_id")]
+
+
+# ------------------------------------------------ 飛書問題卡（Sub 決策回答）
 def build_question_card(title, questions, cid, answers, done=False):
     """已答的問題只顯示文字(無按鈕)、未答的才有按鈕；done=True → 綠底完成、整張無按鈕。"""
     elems = []
@@ -320,8 +402,83 @@ def handle_ask_click(value):
     return build_question_card(snap["title"], snap["questions"], cid, snap["answers"], done=done)
 
 
+# ----------------------------------------------------- 飛書指令框架
+# 好加新指令：@command("/xxx") 掛一個 handler(ctx)。ctx 有 open_id / chat_id / args。
+COMMANDS = {}  # "/name"(lower) -> {"fn":..., "usage":...}
+
+
+class CmdCtx:
+    def __init__(self, open_id, chat_id, args):
+        self.open_id = open_id
+        self.chat_id = chat_id
+        self.args = args
+
+
+def command(name, usage=""):
+    def deco(fn):
+        COMMANDS[name.lower()] = {"fn": fn, "usage": usage}
+        return fn
+    return deco
+
+
+_MENTION_RE = re.compile(r"@_(?:user_\d+|all)\s*")  # 群訊息 @機器人 會留下 @_user_1 佔位
+
+
+def handle_message(open_id, chat_id, text):
+    """群訊息進來：去掉 @佔位，找 /指令 分派；非指令忽略。"""
+    text = _MENTION_RE.sub("", text or "").strip()
+    if not text.startswith("/"):
+        return
+    head, _, rest = text.partition(" ")
+    entry = COMMANDS.get(head.lower())
+    if not entry:
+        feishu_reply_text(chat_id, f"未知指令 {head}。可用：{', '.join(sorted(COMMANDS))}")
+        return
+    try:
+        entry["fn"](CmdCtx(open_id, chat_id, rest.strip()))
+    except Exception as e:  # noqa: BLE001 - 單一指令失敗不可影響長連接
+        print(f"[cmd] {head} 失敗: {e}", flush=True)
+        feishu_reply_text(chat_id, f"指令 {head} 執行失敗：{e}")
+
+
+@command("/help", "顯示可用指令")
+def cmd_help(ctx):
+    lines = ["📖 可用指令："]
+    for name in sorted(COMMANDS):
+        lines.append(f"· {name}　{COMMANDS[name]['usage']}")
+    feishu_reply_text(ctx.chat_id, "\n".join(lines))
+
+
+@command("/bindCheck", "查綁定：/bindCheck <IP 或 Zentao 帳號 或 飛書名稱>（留空列全部）")
+def cmd_bind_check(ctx):
+    q = ctx.args.strip()
+    with db() as c:
+        if q:
+            like = f"%{q}%"
+            rows = c.execute(
+                "SELECT * FROM subs WHERE addr LIKE ? OR hostname LIKE ? OR zentao_account LIKE ? "
+                "OR feishu_name LIKE ? OR feishu_open_id=? ORDER BY id",
+                (like, like, like, like, q),
+            ).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM subs ORDER BY id").fetchall()
+    if not rows:
+        feishu_reply_text(ctx.chat_id, f"查無綁定：{q or '(全部)'}")
+        return
+    lines = ["🔗 綁定狀態" + (f"（查詢：{q}）" if q else "")]
+    for r in rows:
+        state = "✅啟用" if r["enabled"] else "⛔停用"
+        lines.append(
+            f"· {r['hostname'] or '?'}（{r['addr'] or '未上線'}）{state}\n"
+            f"　Zentao：{r['zentao_account'] or '未綁'}　飛書：{r['feishu_name'] or '未綁'}\n"
+            f"　最後上線：{r['last_seen'] or '—'}"
+        )
+    feishu_reply_text(ctx.chat_id, "\n".join(lines))
+
+
+# ----------------------------------------------------- 飛書長連接
 def start_feishu_listener():
-    """長連接接卡片回調：屬本系統提問(zyo=ask)就路由答案，其餘轉發給 Master。跑在背景執行緒、阻塞。"""
+    """長連接同時處理：卡片回調(問題卡答案) + 群訊息指令。跑在背景執行緒、阻塞、斷線自動重連。"""
     cfg = feishu_cfg()
     app_id, app_secret = cfg.get("app_id"), cfg.get("app_secret")
     if not (app_id and app_secret):
@@ -332,8 +489,9 @@ def start_feishu_listener():
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
             P2CardActionTrigger, P2CardActionTriggerResponse,
         )
-    except ImportError:
-        print("[feishu] 缺 lark-oapi，不啟動長連接", flush=True)
+        from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+    except ImportError as e:
+        print(f"[feishu] 缺 lark-oapi（{e}），不啟動長連接", flush=True)
         return
 
     def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
@@ -347,19 +505,35 @@ def start_feishu_listener():
                 card = handle_ask_click(value)
                 if card is not None:
                     resp["card"] = {"type": "raw", "data": card}  # 回應直接帶新卡片 → 即時換掉、不卡
-            else:  # 非本系統卡片（例如手動測試），轉發給 Master 顯示
-                raw = json.dumps({"title": "飛書回調", "text": json.dumps(value, ensure_ascii=False),
-                                  "feishu_callback": value, "open_id": open_id}, ensure_ascii=False)
-                _deliver("飛書回調", raw, raw, raw.encode("utf-8"))
+            else:  # 非本系統卡片（例如手動測試），存起來給網頁看
+                store_message("飛書回調", json.dumps(value, ensure_ascii=False),
+                              json.dumps({"feishu_callback": value, "open_id": open_id}, ensure_ascii=False))
         except Exception as e:  # noqa: BLE001
             print(f"[feishu] 處理回調失敗: {e}", flush=True)
         return P2CardActionTriggerResponse(resp)
 
-    handler = lark.EventDispatcherHandler.builder("", "").register_p2_card_action_trigger(on_card_action).build()
-    # 斷線自動重連：長連接掉了就等 30 秒重來，別讓站台靜默停止收回調
+    def on_message(data: P2ImMessageReceiveV1) -> None:
+        try:
+            msg = data.event.message
+            open_id = data.event.sender.sender_id.open_id
+            if msg.message_type != "text":
+                return
+            text = (json.loads(msg.content) or {}).get("text", "")
+            print(f"[feishu] 收訊息 open_id={open_id} text={text!r}", flush=True)
+            handle_message(open_id, msg.chat_id, text)
+        except Exception as e:  # noqa: BLE001
+            print(f"[feishu] 處理訊息失敗: {e}", flush=True)
+
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_card_action_trigger(on_card_action)
+        .register_p2_im_message_receive_v1(on_message)
+        .build()
+    )
+    # 斷線自動重連：長連接掉了就等 30 秒重來，別讓站台靜默停止收事件
     while True:
         try:
-            print("[feishu] 長連接啟動中…（card.action.trigger）", flush=True)
+            print("[feishu] 長連接啟動中…（卡片回調 + 群訊息指令）", flush=True)
             lark.ws.Client(app_id, app_secret, event_handler=handler, log_level=lark.LogLevel.INFO).start()
         except Exception as e:  # noqa: BLE001
             print(f"[feishu] 長連接中斷：{e}；30 秒後重連", flush=True)
@@ -398,8 +572,41 @@ def webhook():
         "content": detail.get("content", "") or pbody,
     }
     raw_enriched = json.dumps(enriched, ensure_ascii=False)
-    n = _deliver(enriched["title"], enriched["content"], raw_enriched, raw_enriched.encode("utf-8"))
-    return jsonify(ok=True, forwarded=n, enriched=enriched)
+    store_message(enriched["title"], enriched["content"], raw_enriched)
+    # 依負責人直接派給綁定的 Sub（Master 中間層已移除）
+    addr = sub_for_account(enriched["assignee"])
+    dispatched = False
+    if addr:
+        dispatched = dispatch_to_sub(addr, raw_enriched.encode("utf-8"))
+    else:
+        print(f"[webhook] 找不到負責 {enriched['assignee']!r} 的 Sub，僅記錄不派發", flush=True)
+    return jsonify(ok=True, dispatched=dispatched, enriched=enriched)
+
+
+@app.post("/api/register")
+def api_register():
+    """Sub 開機/定期回報 {hostname, addr}。以 hostname upsert、更新 last_seen，回目前綁定給 Sub 顯示。"""
+    d = request.get_json(force=True, silent=True) or {}
+    hostname = (d.get("hostname") or "").strip()
+    addr = norm_addr(d.get("addr") or "")
+    if not hostname or not addr:
+        return jsonify(error="need hostname / addr"), 400
+    with db() as c:
+        c.execute(
+            """INSERT INTO subs(hostname, addr, last_seen)
+                 VALUES(?, ?, datetime('now','localtime'))
+               ON CONFLICT(hostname) DO UPDATE SET
+                 addr=excluded.addr, last_seen=datetime('now','localtime')""",
+            (hostname, addr),
+        )
+        r = c.execute(
+            "SELECT zentao_account, feishu_name, enabled FROM subs WHERE hostname=?", (hostname,)
+        ).fetchone()
+    return jsonify(ok=True, binding={
+        "zentao_account": r["zentao_account"] or "",
+        "feishu_name": r["feishu_name"] or "",
+        "enabled": bool(r["enabled"]),
+    })
 
 
 @app.post("/api/test-send")
@@ -407,10 +614,10 @@ def test_send():
     d = request.get_json(force=True, silent=True) or {}
     title = d.get("title") or "測試通知"
     body = d.get("body") or "這是一則測試訊息"
-    # 轉發的 payload 要帶內容，Master 才解析得出東西（否則收到空的 {}）
-    raw = json.dumps({"title": title, "text": body}, ensure_ascii=False)
-    n = _deliver(title, body, raw, raw.encode("utf-8"))
-    return jsonify(ok=True, forwarded=n)
+    raw = json.dumps({"title": title, "body": body}, ensure_ascii=False)
+    store_message(title, body, raw)
+    n = push_to_subs(raw.encode("utf-8"))
+    return jsonify(ok=True, pushed=n)
 
 
 @app.post("/lark/ask")
@@ -440,53 +647,50 @@ def lark_ask():
 
 @app.get("/api/users")
 def api_users():
-    """給 Master 撈 Zentao 使用者清單（account + 中文 realname）。"""
+    """給控管網頁撈 Zentao 使用者清單（account + 中文 realname）。"""
     try:
         return jsonify(zentao_users())
     except Exception as e:  # noqa: BLE001
         return jsonify(error=str(e)), 502
 
 
-@app.get("/api/masters")
-def list_masters():
+@app.get("/api/feishu-members")
+def api_feishu_members():
+    """給控管網頁撈飛書群成員（open_id + name）做綁定下拉。"""
+    try:
+        return jsonify(feishu_chat_members())
+    except Exception as e:  # noqa: BLE001
+        return jsonify(error=str(e)), 502
+
+
+@app.get("/api/subs")
+def list_subs():
     with db() as c:
-        return jsonify([dict(r) for r in c.execute("SELECT * FROM masters ORDER BY id")])
+        return jsonify([dict(r) for r in c.execute("SELECT * FROM subs ORDER BY id")])
 
 
-@app.post("/api/masters")
-def add_master():
+@app.put("/api/subs/<int:sid>")
+def update_sub(sid):
+    """綁定：設定這台 Sub 對應的 Zentao 帳號 / 飛書用戶 / 啟用。"""
     d = request.get_json(force=True, silent=True) or {}
-    name = (d.get("name") or "").strip()
-    addr = norm_addr(d.get("addr") or "")
-    if not name or not addr:
-        return jsonify(error="名稱和位址都要填"), 400
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO masters(name, addr, enabled) VALUES(?,?,?)",
-            (name, addr, 1 if d.get("enabled", True) else 0),
-        )
-        return jsonify(id=cur.lastrowid)
-
-
-@app.put("/api/masters/<int:mid>")
-def update_master(mid):
-    d = request.get_json(force=True, silent=True) or {}
-    name = (d.get("name") or "").strip()
-    addr = norm_addr(d.get("addr") or "")
-    if not name or not addr:
-        return jsonify(error="名稱和位址都要填"), 400
     with db() as c:
         c.execute(
-            "UPDATE masters SET name=?, addr=?, enabled=? WHERE id=?",
-            (name, addr, 1 if d.get("enabled", True) else 0, mid),
+            "UPDATE subs SET zentao_account=?, feishu_open_id=?, feishu_name=?, enabled=? WHERE id=?",
+            (
+                (d.get("zentao_account") or "").strip(),
+                (d.get("feishu_open_id") or "").strip(),
+                (d.get("feishu_name") or "").strip(),
+                1 if d.get("enabled", True) else 0,
+                sid,
+            ),
         )
     return jsonify(ok=True)
 
 
-@app.delete("/api/masters/<int:mid>")
-def delete_master(mid):
+@app.delete("/api/subs/<int:sid>")
+def delete_sub(sid):
     with db() as c:
-        c.execute("DELETE FROM masters WHERE id=?", (mid,))
+        c.execute("DELETE FROM subs WHERE id=?", (sid,))
     return jsonify(ok=True)
 
 

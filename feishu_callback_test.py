@@ -1,14 +1,14 @@
 """飛書卡片回調最小測試 —— 證明「按鈕點擊收得回來」。
 
 做兩件事：
-  1. 發一張帶兩顆選項按鈕的互動卡片到群組（chat_id 讀 Master 存的 lark.json）
+  1. 發一張帶兩顆選項按鈕的互動卡片到群組（chat_id 讀站台 feishu.json）
   2. 啟動長連接，印出你在飛書點的按鈕內容（value + 點的人 open_id）
 
 跑法：
   pip install -U lark-oapi
   python feishu_callback_test.py
 
-憑證與群組讀 Master 存的 %APPDATA%\\ZyoFlow\\lark.json（app_id / app_secret / chat_id）。
+憑證讀站台 feishu.json（app_id / app_secret / chat_id），退回舊的 %APPDATA%\\ZyoFlow\\lark.json。
 站台對不對外網都無所謂——是這支程式「撥出去」連飛書，不是飛書打進來。
 """
 import json
@@ -30,10 +30,15 @@ HOST = "https://open.feishu.cn"  # 中國版飛書
 
 
 def load_creds():
-    """讀 Master 存的設定（App ID/Secret/固定群組 chat_id）。"""
-    p = Path(os.environ.get("APPDATA", str(Path.home()))) / "ZyoFlow" / "lark.json"
-    cfg = json.loads(p.read_text(encoding="utf-8-sig"))
-    return cfg["app_id"], cfg["app_secret"], cfg.get("chat_id", "")
+    """讀憑證：優先站台 feishu.json（cwd），退回舊的 %APPDATA%\\ZyoFlow\\lark.json。"""
+    for p in (Path("feishu.json"),
+              Path(os.environ.get("APPDATA", str(Path.home()))) / "ZyoFlow" / "lark.json"):
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+            return cfg["app_id"], cfg["app_secret"], cfg.get("chat_id", "")
+        except Exception:
+            continue
+    raise SystemExit("找不到 feishu.json 或 lark.json（需 app_id/app_secret/chat_id）")
 
 
 APP_ID, APP_SECRET, CHAT_ID = load_creds()
@@ -102,7 +107,7 @@ if __name__ == "__main__":
         send_test_card()
         print(f"卡片已發到群組 {CHAT_ID}，去飛書點按鈕；長連接啟動中…", flush=True)
     else:
-        print("lark.json 沒有 chat_id：先在 Master 選好群組。仍會啟動長連接等回調。", flush=True)
+        print("feishu.json 沒有 chat_id：先填好目標群組。仍會啟動長連接等回調。", flush=True)
 
     handler = (
         lark.EventDispatcherHandler.builder("", "")  # (encrypt_key, verification_token) 都空：長連接免加密

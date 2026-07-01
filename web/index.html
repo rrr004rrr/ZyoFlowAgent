@@ -3,87 +3,109 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ZyoFlow 站台閘道</title>
+<title>ZyoFlow Stage 控管</title>
 <style>
-  body { font-family: system-ui, "Microsoft JhengHei", sans-serif; margin: 24px; max-width: 900px; }
+  body { font-family: system-ui, "Microsoft JhengHei", sans-serif; margin: 24px; max-width: 1000px; }
   h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
   table { border-collapse: collapse; width: 100%; }
   th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 14px; }
   th { background: #f5f5f5; }
-  input[type=text] { padding: 5px; }
+  select, input[type=text] { padding: 5px; max-width: 220px; }
   button { padding: 5px 12px; cursor: pointer; }
   .muted { color: #888; font-size: 13px; }
   .msg { border-left: 3px solid #4a90d9; padding: 4px 10px; margin: 6px 0; background: #fafafa; }
-  .row { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
 </style>
 </head>
 <body>
-  <h1>ZyoFlow 站台閘道</h1>
+  <h1>ZyoFlow Stage 控管</h1>
   <p class="muted">
-    Zentao webhook 指向 <code id="hookUrl"></code>（設定一次就好）　·　收到後轉發給下面啟用的 Master
+    Zentao webhook 指向 <code id="hookUrl"></code>（設定一次）　·　Sub 開機自動報到，於下方把每台 Sub 綁到 Zentao 負責人與飛書用戶
   </p>
 
-  <h2>轉發到的 Master</h2>
+  <h2>Sub 綁定 <button onclick="loadAll()">重新整理</button></h2>
   <table>
-    <thead><tr><th>名稱</th><th>位址（host:port）</th><th>啟用</th><th>操作</th></tr></thead>
-    <tbody id="masters"></tbody>
+    <thead><tr>
+      <th>電腦名稱</th><th>IP</th><th>Zentao 負責人</th><th>飛書用戶</th><th>啟用</th><th>最後上線</th><th>操作</th>
+    </tr></thead>
+    <tbody id="subs"></tbody>
   </table>
-  <div class="row">
-    <input type="text" id="name" placeholder="名稱（例：我的電腦）">
-    <input type="text" id="addr" placeholder="位址（例：192.168.x.x:39218）">
-    <button onclick="addMaster()">新增</button>
-  </div>
+  <p class="muted" id="subsHint"></p>
 
-  <h2>最近收到的通知 <button onclick="loadMsgs()">重新整理</button>
-    <button onclick="testSend()">送測試訊息</button></h2>
+  <h2>最近收到的通知
+    <button onclick="loadMsgs()">重新整理</button>
+    <button onclick="testSend()">送測試訊息</button>
+  </h2>
   <div id="msgs"></div>
 
 <script>
 document.getElementById('hookUrl').textContent = location.origin + '/webhook';
-let MASTERS = [];
+let USERS = [], MEMBERS = [], SUBS = [];
 
-async function loadMasters() {
-  MASTERS = await (await fetch('/api/masters')).json();
-  document.getElementById('masters').innerHTML = MASTERS.map(m => `
+async function fetchJson(u) {
+  try { const j = await (await fetch(u)).json(); return Array.isArray(j) ? j : []; }
+  catch (e) { return []; }
+}
+function opt(val, label, sel) {
+  return `<option value="${esc(val)}" ${val === sel ? 'selected' : ''}>${esc(label)}</option>`;
+}
+async function loadAll() {
+  [SUBS, USERS, MEMBERS] = await Promise.all([
+    fetchJson('/api/subs'), fetchJson('/api/users'), fetchJson('/api/feishu-members'),
+  ]);
+  renderSubs();
+}
+function renderSubs() {
+  const uOpts = sel => '<option value="">未綁</option>' +
+    USERS.map(u => opt(u.account, (u.realname && u.realname !== u.account) ? `${u.realname}（${u.account}）` : u.account, sel)).join('');
+  const mOpts = sel => '<option value="">未綁</option>' +
+    MEMBERS.map(m => opt(m.open_id, m.name || m.open_id, sel)).join('');
+  document.getElementById('subs').innerHTML = SUBS.map(s => `
     <tr>
-      <td>${esc(m.name)}</td>
-      <td>${esc(m.addr)}</td>
-      <td><input type="checkbox" ${m.enabled ? 'checked' : ''} onchange="toggle(${m.id}, this.checked)"></td>
-      <td><button onclick="del(${m.id})">刪除</button></td>
-    </tr>`).join('') || '<tr><td colspan="4" class="muted">尚無 Master，請新增。</td></tr>';
+      <td>${esc(s.hostname || '?')}</td>
+      <td>${esc(s.addr || '')}</td>
+      <td><select id="z_${s.id}">${uOpts(s.zentao_account || '')}</select></td>
+      <td><select id="f_${s.id}">${mOpts(s.feishu_open_id || '')}</select></td>
+      <td><input type="checkbox" id="e_${s.id}" ${s.enabled ? 'checked' : ''}></td>
+      <td class="muted">${esc(s.last_seen || '—')}</td>
+      <td><button onclick="saveSub(${s.id})">儲存</button> <button onclick="delSub(${s.id})">刪除</button></td>
+    </tr>`).join('') || '<tr><td colspan="7" class="muted">尚無 Sub 報到。啟動 Sub 後會自動出現在這裡。</td></tr>';
+  const hints = [];
+  if (!USERS.length) hints.push('Zentao 名單空：確認站台 zentao.json。');
+  if (!MEMBERS.length) hints.push('飛書名單空：確認 feishu.json 的 chat_id 與 im:chat 權限。');
+  document.getElementById('subsHint').textContent = hints.join('　');
 }
-async function addMaster() {
-  const name = document.getElementById('name').value.trim();
-  const addr = document.getElementById('addr').value.trim();
-  if (!name || !addr) { alert('名稱和位址都要填'); return; }
-  const r = await fetch('/api/masters', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({name, addr})});
-  if (!r.ok) { alert((await r.json()).error || '新增失敗'); return; }
-  document.getElementById('name').value = ''; document.getElementById('addr').value = '';
-  loadMasters();
+async function saveSub(id) {
+  const z = document.getElementById('z_' + id).value;
+  const fsel = document.getElementById('f_' + id);
+  const fo = fsel.value;
+  const fn = fo ? fsel.options[fsel.selectedIndex].text : '';
+  const en = document.getElementById('e_' + id).checked;
+  await fetch('/api/subs/' + id, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zentao_account: z, feishu_open_id: fo, feishu_name: fn, enabled: en }),
+  });
+  loadAll();
 }
-async function toggle(id, enabled) {
-  const m = MASTERS.find(x => x.id === id);
-  await fetch('/api/masters/' + id, {method:'PUT', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({name: m.name, addr: m.addr, enabled})});
-}
-async function del(id) {
-  if (!confirm('確定刪除？')) return;
-  await fetch('/api/masters/' + id, {method:'DELETE'}); loadMasters();
+async function delSub(id) {
+  if (!confirm('確定刪除這台 Sub 的綁定？（Sub 再次報到會重新出現）')) return;
+  await fetch('/api/subs/' + id, { method: 'DELETE' });
+  loadAll();
 }
 async function loadMsgs() {
-  const m = await (await fetch('/api/messages')).json();
+  const m = await fetchJson('/api/messages');
   document.getElementById('msgs').innerHTML = m.map(x => `
-    <div class="msg"><b>${esc(x.title||'')}</b> <span class="muted">${x.created_at}</span>
-      <div>${esc(x.body||'')}</div></div>`).join('') || '<p class="muted">尚無通知。</p>';
+    <div class="msg"><b>${esc(x.title || '')}</b> <span class="muted">${x.created_at}</span>
+      <div>${esc(x.body || '')}</div></div>`).join('') || '<p class="muted">尚無通知。</p>';
 }
 async function testSend() {
-  const r = await (await fetch('/api/test-send', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({})})).json();
-  alert('已送出，轉發給 ' + r.forwarded + ' 台 Master'); loadMsgs();
+  const r = await (await fetch('/api/test-send', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+  })).json();
+  alert('已送出，推給 ' + (r.pushed || 0) + ' 台 Sub');
+  loadMsgs();
 }
-function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-loadMasters(); loadMsgs();
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+loadAll(); loadMsgs();
 </script>
 </body>
 </html>
