@@ -93,8 +93,8 @@ build.bat            # 打包 → dist/zyoflow.exe（含 lark-oapi 長連接）
   "claude_bin": "claude",
   "worktree_root": "D:/zyoflow/worktrees",
   "repos": [
-    { "name": "前端", "path": "D:/work/frontend", "keywords": "前端, React, 畫面, UI" },
-    { "name": "API",  "path": "D:/work/api",      "keywords": "API, 後端, REST, 資料庫" }
+    { "name": "前端", "path": "D:/work/frontend", "must": "官網專案", "keywords": "前端, React, 畫面, UI" },
+    { "name": "API",  "path": "D:/work/api",      "must": "",         "keywords": "API, 後端, REST, 資料庫" }
   ]
 }
 ```
@@ -105,7 +105,7 @@ cd sub && cargo build --release        # 或 build.bat
 
 開 `zyoflow-sub.exe` 後會**自動把電腦名稱 + IP 報到給 Stage**，然後出現在 Stage 控管網頁。
 
-> `self_addr` 留空會自動偵測本機 LAN IP。「綁定狀態」分頁可看本機在 Stage 的綁定。`repos` 用 AI 依 `keywords` + 任務內容挑一個，所以**不必對照禪道的 product 設定**。
+> `self_addr` 留空會自動偵測本機 LAN IP。「綁定狀態」分頁可看本機在 Stage 的綁定。挑 repo 分兩層：先用 **`must`（必填關鍵字，硬條件，例如專案名稱）** 篩候選——`must` 命中任務全文才入選，留空代表不限；再由 **AI 依 `keywords`（選填，軟提示）+ 任務內容** 從候選挑一個。所以**不必對照禪道的 product 設定**；若沒有任何 repo 的 `must` 符合，該任務會被略過不派（避免動到錯的專案）。
 
 ### 3. 綁定（在 Stage 控管網頁）
 開 `http://<Stage>:39217/`，在「Sub 綁定」表把每台報到的 Sub 選好對應的 **Zentao 負責人**（下拉，來自禪道名單）與 **飛書用戶**（下拉，來自群成員），按儲存。之後：
@@ -121,7 +121,7 @@ cd sub && cargo build --release        # 或 build.bat
 |------|------|
 | `zentao.json`（Stage exe 旁） | 禪道 `url / account / password` |
 | `feishu.json`（Stage exe 旁） | 飛書 `app_id / app_secret / chat_id`（目標群組） |
-| `sub.json`（Sub exe 旁） | Stage 位址、worktree 根目錄、各 repo 路徑＋關鍵字 |
+| `sub.json`（Sub exe 旁） | Stage 位址、worktree 根目錄、各 repo 路徑＋`must`（必填/硬條件）＋`keywords`（選填/軟提示） |
 | Stage 控管網頁 | Sub 綁定表（電腦 → Zentao 負責人 + 飛書用戶）；資料存在 Stage 的 `zyoflow.sqlite` |
 
 > 含帳密 / 本機路徑的檔案**已列入 `.gitignore`，請勿 commit**。範例見各 `*.example.json`。

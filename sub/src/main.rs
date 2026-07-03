@@ -26,6 +26,18 @@ use std::time::Duration;
 
 const WINDOW_TITLE: &str = "ZyoFlow Sub";
 
+/// 一律背景執行的 Command：Windows 上加 CREATE_NO_WINDOW，避免子行程（claude/git/hostname）閃現主控台視窗。
+fn command(program: &str) -> Command {
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}
+
 #[derive(Clone)]
 struct Msg {
     title: String,
@@ -57,7 +69,8 @@ struct AppState {
 // ------------------------------------------------------------ 設定
 struct Repo {
     path: String,
-    keywords: String, // 描述/關鍵字，AI 依此 + 任務內容挑這個 repo
+    must: String,     // 必填關鍵字：硬條件（例如專案名稱）；命中才可能被選，空=不限
+    keywords: String, // 選填關鍵字：軟提示，AI 依此 + 任務內容挑
     name: String,     // 顯示用，可省
 }
 
@@ -90,6 +103,7 @@ fn load_config() -> SubConfig {
             }
             repos.push(Repo {
                 path,
+                must: r.get("must").and_then(Value::as_str).unwrap_or("").to_string(),
                 keywords: r.get("keywords").and_then(Value::as_str).unwrap_or("").to_string(),
                 name: r.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             });
@@ -113,7 +127,7 @@ fn local_ip() -> Option<String> {
 
 /// 電腦名稱（站台綁定用的穩定鍵）：先試 hostname 指令，再退環境變數。
 fn hostname() -> String {
-    if let Ok(out) = Command::new("hostname").output() {
+    if let Ok(out) = command("hostname").output() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !s.is_empty() {
             return s;
@@ -306,14 +320,21 @@ fn run_task(task: Task, cfg: Arc<SubConfig>, pending: Pending, feed: Feed) {
     let repo = if cfg.repos.is_empty() {
         None
     } else {
-        let idx = pick_repo_index(&cfg, &task).unwrap_or(1);
-        let r = &cfg.repos[idx - 1];
-        report(
-            &feed,
-            &task,
-            format!("🧭 選定程式庫：{}", if r.name.is_empty() { &r.path } else { &r.name }),
-        );
-        Some(PathBuf::from(&r.path))
+        match pick_repo_index(&cfg, &task) {
+            Some(idx) => {
+                let r = &cfg.repos[idx - 1];
+                report(
+                    &feed,
+                    &task,
+                    format!("🧭 選定程式庫：{}", if r.name.is_empty() { &r.path } else { &r.name }),
+                );
+                Some(PathBuf::from(&r.path))
+            }
+            None => {
+                report(&feed, &task, "⛔ 沒有程式庫的必填關鍵字(must)符合此任務，略過不派");
+                return;
+            }
+        }
     };
     let workdir = setup_worktree(&cfg, &task, repo.as_deref());
     report(&feed, &task, format!("工作目錄：{}", workdir.display()));
@@ -381,7 +402,7 @@ fn run_claude(
     bin: &str,
 ) -> Result<(String, String), String> {
     // ponytail: 先用 acceptEdits（可改檔、破壞性工具仍會被擋）；要跑測試/指令再依 repo 配 --allowedTools。
-    let mut cmd = Command::new(bin);
+    let mut cmd = command(bin);
     cmd.current_dir(workdir)
         .args(["-p", "--output-format", "json", "--permission-mode", "acceptEdits"]);
     if let Some(sid) = session {
@@ -495,7 +516,7 @@ fn setup_worktree(cfg: &SubConfig, task: &Task, repo: Option<&Path>) -> PathBuf 
             let wt = PathBuf::from(&cfg.worktree_root).join(format!("task-{}", task.task_id));
             let branch = format!("zyoflow/task-{}", task.task_id);
             let try_add = |extra: &[&str]| {
-                Command::new("git")
+                command("git")
                     .arg("-C")
                     .arg(repo)
                     .args(["worktree", "add", "--force"])
@@ -516,19 +537,55 @@ fn setup_worktree(cfg: &SubConfig, task: &Task, repo: Option<&Path>) -> PathBuf 
     dir
 }
 
-/// AI 依各 repo 關鍵字 + 任務內容選一個程式庫，回 1-based 編號；AI 失敗退回關鍵字比對。
+/// 先用「必填關鍵字(must)」硬篩候選 repo，再用 AI + 選填關鍵字挑一個。
+/// 回 1-based 全域編號；沒有 repo 通過 must → None（呼叫端據此中止，不亂派到錯的 repo）。
 fn pick_repo_index(cfg: &SubConfig, task: &Task) -> Option<usize> {
-    let n = cfg.repos.len();
-    if n == 0 {
+    if cfg.repos.is_empty() {
         return None;
     }
-    if n == 1 {
-        return Some(1);
+    let hay = task_haystack(task);
+    let cands: Vec<usize> = cfg
+        .repos
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| passes_must(r, &hay))
+        .map(|(i, _)| i + 1)
+        .collect();
+    match cands.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        _ => ai_pick_among(cfg, task, &cands).or_else(|| keyword_pick_among(&cfg.repos, &hay, &cands)),
     }
+}
+
+/// 任務全文（小寫），供 must / keywords 比對。
+fn task_haystack(task: &Task) -> String {
+    format!("{} {} {} {}", task.title, task.content, task.product, task.module).to_lowercase()
+}
+
+/// 拆關鍵字字串成小寫 token（逗號/全形逗號/空白/頓號分隔）。
+fn split_keywords(s: &str) -> Vec<String> {
+    s.split([',', '，', ' ', '、'])
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// 硬條件：must 為空→永遠通過；否則任一 must token 命中任務全文才通過。
+fn passes_must(repo: &Repo, hay: &str) -> bool {
+    // ponytail: must 比對整段任務全文（含 product）；要嚴格只比 product 再改。
+    let toks = split_keywords(&repo.must);
+    toks.is_empty() || toks.iter().any(|k| hay.contains(k.as_str()))
+}
+
+/// AI 在候選 repo 中挑一個，回全域 1-based 編號；AI 失敗回 None。
+fn ai_pick_among(cfg: &SubConfig, task: &Task, cands: &[usize]) -> Option<usize> {
     let mut list = String::new();
-    for (i, r) in cfg.repos.iter().enumerate() {
+    for (n, &gi) in cands.iter().enumerate() {
+        let r = &cfg.repos[gi - 1];
         let name = if r.name.is_empty() { &r.path } else { &r.name };
-        list.push_str(&format!("{}. {} — {}\n", i + 1, name, r.keywords));
+        list.push_str(&format!("{}. {} — {}\n", n + 1, name, r.keywords));
     }
     let prompt = format!(
         "任務標題：{title}\n產品：{product}　模組：{module}\n任務內容：\n{content}\n\n\
@@ -543,8 +600,8 @@ fn pick_repo_index(cfg: &SubConfig, task: &Task) -> Option<usize> {
     let workdir = PathBuf::from(&cfg.worktree_root);
     run_claude(&workdir, &prompt, &None, &cfg.claude_bin)
         .ok()
-        .and_then(|(result, _)| parse_repo_pick(&result, n))
-        .or_else(|| keyword_pick(&cfg.repos, task))
+        .and_then(|(result, _)| parse_repo_pick(&result, cands.len()))
+        .map(|local| cands[local - 1])
 }
 
 fn parse_repo_pick(result: &str, count: usize) -> Option<usize> {
@@ -572,25 +629,21 @@ fn first_number(s: &str) -> Option<usize> {
     num.parse().ok()
 }
 
-/// AI 失敗時的後備：哪個 repo 的關鍵字在任務文字裡命中最多就選它。
-fn keyword_pick(repos: &[Repo], task: &Task) -> Option<usize> {
-    let hay = format!("{} {} {} {}", task.title, task.content, task.product, task.module).to_lowercase();
+/// AI 失敗時的後備：候選中「選填關鍵字」命中最多者；全 0 分→回第一個候選（已過 must，任一都合法）。
+fn keyword_pick_among(repos: &[Repo], hay: &str, cands: &[usize]) -> Option<usize> {
     let mut best: Option<usize> = None;
     let mut best_score = 0usize;
-    for (i, r) in repos.iter().enumerate() {
-        let score = r
-            .keywords
-            .split([',', '，', ' ', '、'])
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-            .filter(|k| hay.contains(&k.to_lowercase()))
+    for &gi in cands {
+        let score = split_keywords(&repos[gi - 1].keywords)
+            .iter()
+            .filter(|k| hay.contains(k.as_str()))
             .count();
         if score > best_score {
             best_score = score;
-            best = Some(i + 1);
+            best = Some(gi);
         }
     }
-    best
+    best.or_else(|| cands.first().copied())
 }
 
 // -------------------------------------------------------- 共用工具
@@ -940,5 +993,21 @@ mod tests {
         assert_eq!(qs.len(), 1);
         // 沒標記 → None
         assert!(parse_ask_marker("純文字完成了").is_none());
+    }
+
+    #[test]
+    fn must_gates_and_keyword_picks() {
+        let repos = vec![
+            Repo { path: "a".into(), must: "官網專案".into(), keywords: "前端,ui".into(), name: "前端".into() },
+            Repo { path: "b".into(), must: "".into(), keywords: "api,後端".into(), name: "API".into() },
+        ];
+        let hay = "做官網專案的前端 UI 畫面".to_lowercase();
+        assert!(passes_must(&repos[0], &hay)); // must 命中
+        assert!(passes_must(&repos[1], &hay)); // must 空 → 永遠通過
+        let other = "調 api 後端資料".to_lowercase();
+        assert!(!passes_must(&repos[0], &other)); // must 未命中 → 擋
+        // 候選=兩個時，選填關鍵字命中多者勝
+        assert_eq!(keyword_pick_among(&repos, &hay, &[1, 2]), Some(1));
+        assert_eq!(keyword_pick_among(&repos, &other, &[1, 2]), Some(2));
     }
 }
